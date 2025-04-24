@@ -2,5 +2,6 @@
 
 ToDo:
 Make Peat Layers be a raster of 1s and 0s
+Use ngb not bilinear to resample
 
 ![alt text](https://github.com/CTimBru/EcoModel_CTBPlover/blob/main/Rplot111.png?raw=true)
