@@ -7,6 +7,10 @@ require(raster)
 require(dplyr)
 require(terra)
 require(stars)
+require(randomForest)
+require(plyr)
+require(viridis)
+require(ggplot2)
 
 #Set working directory
 wd <- "/Users/LilC/Desktop/WLAC/CTB-Plover"
@@ -149,39 +153,157 @@ PloverClim_variables <- c()
 bool_modelOne <- TRUE
 
 if(bool_modelOne == TRUE) {
+  #Creata a container for our rasters
   PloverClim_variables <- c()
+  #Select the data source(s) for this model
   data_sources <- c("GBCMAclim_bio1970-2000")
   for(data_source in data_sources){
+    #List the tif files in the chosen directory
     data_layers <- list.files(path=data_source,pattern = "\\.tif$")
+    #stack together all of the tifs into the variables container
     PloverClim_variables <- stack(paste(data_source,"/",data_layers,sep=""))
+    #name all of the layers in accordance to the filenames
     names(PloverClim_variables) <- data_layers
   }
   
+  # We are going to convert all of the three peat layers into their own separate raster layers
+  
+  #Get the unique categories of peat
   unique_peat_cats <- unique(GBCMA_peat$PCLASSDESC)
+  #Creat an empty container for our rasters
   peat_layers <- c()
+  
   i=1
-
   for(peat_cat in unique_peat_cats){
-    #TODO: need to set values to 1 & 0
+    #Rasterize the peat shapefile, for one particular category of peat.
     temp <- st_rasterize(GBCMA_peat[GBCMA_peat$PCLASSDESC==peat_cat,] %>% dplyr::select(PCLASSDESC, geometry))
+    
+    #Rast & Raster the output
     temp <- rast(temp)
     temp <- raster(temp)
+    
+    #Crop & Mask to Cumbria
     temp <- crop(temp, spd)
     temp <- mask(temp, spd)
-    #Resample to match spd layer
-    temp <- resample(temp, PloverClim_variables[[1]], method="bilinear")
+    #Resample to match spd layer, this data is categorical so is ngb better than bilinear
+    temp <- resample(temp, PloverClim_variables[[1]], method="ngb")
+    #Places the raster in our peat raster container
     peat_layers[[i]] <- temp
     i=i+1
   }
+  
+  #The data frames later prefer no spaces in their columns, so eliminate the spaces from the peat categories
+  unique_peat_cats <- gsub(" ",".",unique_peat_cats)
+  
+  #Stack the peat layers in one raster stack
   GBCMA_peat_layers <- stack(peat_layers)
+  #Name the layers in the raster stack after the peat categories
   names(GBCMA_peat_layers) <- unique_peat_cats
+  #Add the peat layers onto of the existing bioClim data
   PloverClim_variables <- stack(PloverClim_variables,GBCMA_peat_layers)
   
+  #extract the data from our raster layers for the observation points
   GBCMA_extracted <-raster::extract(PloverClim_variables,GBCMA_species_points)
+  #copy over the column names to our extracted observations & associated variables
   colnames(GBCMA_extracted) <- names(PloverClim_variables)
+  #Create a dataframe from the extracted data
+  GBCMA_extracted <- as.data.frame(GBCMA_extracted)
   
-  #TODO: Drop only NAN for weather, fixing peat for 1,0 may fix this issue.
-  #GBCMA_extracted <- as.data.frame(GBCMA_extracted[GBCMA_extracted[],])
+  #Factorize the peat data. Current data was just IDs of shapes from the underlaying dataset, replace with 1 (peat present), & 0 (peat absent)
+  for(peat_cat in unique_peat_cats){
+    GBCMA_extracted[[paste(peat_cat)]][!is.na(GBCMA_extracted[[paste(peat_cat)]])] <- 1
+    GBCMA_extracted[[paste(peat_cat)]][is.na(GBCMA_extracted[[paste(peat_cat)]])] <- 0
+    GBCMA_extracted[[paste(peat_cat)]] <- as.factor(GBCMA_extracted[[paste(peat_cat)]])
+  }
+  
+  #Remove any extracted point which has any remaining N/As
+  GBCMA_extracted <- GBCMA_extracted[complete.cases(GBCMA_extracted ),]
+  
+  #Create a new column called prescence, set it to one (present)
+  GBCMA_extracted$presence <- 1
+  #Make the prescence column into a factor
+  GBCMA_extracted$presence <- as.factor(GBCMA_extracted$presence)
+  
+  #COunt the number of occurances, within time-frame and having sufficient data
+  num_occurrences <- nrow(GBCMA_extracted)
+  
+  #Create background points with variable data
+  Background_extracted <-raster::extract(PloverClim_variables,background_points)
+  colnames(Background_extracted) <- names(PloverClim_variables)
+  Background_extracted <- as.data.frame(Background_extracted)
+  
+  #Again factorize peat data.
+  for(peat_cat in unique_peat_cats){
+    Background_extracted[[paste(peat_cat)]][!is.na(Background_extracted[[paste(peat_cat)]])] <- 1
+    Background_extracted[[paste(peat_cat)]][is.na(Background_extracted[[paste(peat_cat)]])] <- 0
+    Background_extracted[[paste(peat_cat)]] <- as.factor(Background_extracted[[paste(peat_cat)]])
+  }
+  
+  #Drop any remaining N/As
+  Background_extracted <- Background_extracted[complete.cases(Background_extracted ),]
+  
+  #Create a new column called prescence, set it to zero (not present)
+  Background_extracted$presence <- 0
+  #Make the prescence column into a factor
+  Background_extracted$presence <- as.factor(Background_extracted$presence)
+  
+  #Empty containers for our model data
+  raster_predict_list <- c()
+  importance_list <- c()
+  accuracy_list <- c()
+  partial_plot_list <- c()
+  
+  j <- 1
+  i <- 1
+  i_max <- 50
+  for(i in 1:i_max){
+    #Get a subset of 80% of present points, and an equal number of absent points
+    subset_extracted <- rbind(GBCMA_extracted[sample(nrow(GBCMA_extracted),0.8*nrow(GBCMA_extracted)),],Background_extracted[sample(nrow(Background_extracted),0.8*nrow(GBCMA_extracted)),])
+    
+    #Run a random forest model over this data subset.
+    rf1 <- suppressWarnings(tuneRF(x=subset_extracted[,!(colnames(subset_extracted) %in% "presence")],y=subset_extracted$presence,stepFactor=1,plot=FALSE,doBest=TRUE))
+    
+    #Make a prediction raster from the random forest model and store it in a list.
+    raster_predict_list[[i]] <- dismo::predict(PloverClim_variables,rf1,progress='text')
+    
+    #ERROR ON LINE 272 plot is all N/A rather than 0,1
+    
+    #Plot predicted raster
+    plot(raster_predict_list[[i]])
+    
+    #Store relative importance of variable outputs as a temporary data frame.
+    tmp <- as.data.frame(rf1$importance)
+    #Set one column to store the variable names from the row names.
+    tmp$VariableName <- rownames(tmp)
+    #Store this importance data frame in the importance list.
+    importance_list[[i]] <- tmp
+    
+    #Calculate the true skill statistic TSS to evaluate model accuracy.
+    sensitivity <- rf1$confusion[[1]] / (rf1$confusion[[1]]+rf1$confusion[[2]])
+    specificity <- rf1$confusion[[4]] / (rf1$confusion[[4]]+rf1$confusion[[3]])
+    TSS <- sensitivity+specificity-1
+    #Store TSS results
+    accuracy_list[i] <- TSS
+    
+    #Currently Broken
+    #Loop through each environmental variable and store the partial response outputs in a temporary data frame.
+    #for(PloverClim_variable in PloverClim_variables){
+    #  #Store partial plot chart data in a temporary data frame.
+    #  tmp <- as.data.frame(partialPlot(rf1,subset_extracted[,!(colnames(subset_extracted) %in% "presence")],x.var=c(PloverClim_variable),plot=F))
+    #  #Transform logistic probabilities to regular probabilities.
+    #  tmp$y <- exp(tmp$y) / (1+exp(tmp$y))
+    #  #Rename probability column
+    #  colnames(tmp) <- c(PloverClim_variable,"Detection_Probability")
+    #  #Store partial plot data in a list of data frames.
+    #  partial_plot_list[[j]] <- tmp
+    #  j <- j+1
+    #}
+    print(paste(i,Sys.time()))
+  }
+  
+  importance_total <- rbind.fill(importance_list)
+  importance_total <- aggregate(x=importance_total$MeanDecreaseGini,by = list(importance_total$VariableName),FUN = mean)
+  colnames(importance_total) <- c("VariableName","Importance")
 }
 
 
